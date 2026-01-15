@@ -1,101 +1,43 @@
-# vary
+# unpipe
 
 [![NPM Version][npm-image]][npm-url]
 [![NPM Downloads][downloads-image]][downloads-url]
-[![Node.js Version][node-version-image]][node-version-url]
+[![Node.js Version][node-image]][node-url]
 [![Build Status][travis-image]][travis-url]
 [![Test Coverage][coveralls-image]][coveralls-url]
 
-Manipulate the HTTP Vary header
+Unpipe a stream from all destinations.
 
 ## Installation
 
-This is a [Node.js](https://nodejs.org/en/) module available through the
-[npm registry](https://www.npmjs.com/). Installation is done using the
-[`npm install` command](https://docs.npmjs.com/getting-started/installing-npm-packages-locally): 
-
 ```sh
-$ npm install vary
+$ npm install unpipe
 ```
 
 ## API
 
-<!-- eslint-disable no-unused-vars -->
-
 ```js
-var vary = require('vary')
+var unpipe = require('unpipe')
 ```
 
-### vary(res, field)
+### unpipe(stream)
 
-Adds the given header `field` to the `Vary` response header of `res`.
-This can be a string of a single field, a string of a valid `Vary`
-header, or an array of multiple fields.
-
-This will append the header if not already listed, otherwise leaves
-it listed in the current location.
-
-<!-- eslint-disable no-undef -->
-
-```js
-// Append "Origin" to the Vary header of the response
-vary(res, 'Origin')
-```
-
-### vary.append(header, field)
-
-Adds the given header `field` to the `Vary` response header string `header`.
-This can be a string of a single field, a string of a valid `Vary` header,
-or an array of multiple fields.
-
-This will append the header if not already listed, otherwise leaves
-it listed in the current location. The new header string is returned.
-
-<!-- eslint-disable no-undef -->
-
-```js
-// Get header string appending "Origin" to "Accept, User-Agent"
-vary.append('Accept, User-Agent', 'Origin')
-```
-
-## Examples
-
-### Updating the Vary header when content is based on it
-
-```js
-var http = require('http')
-var vary = require('vary')
-
-http.createServer(function onRequest (req, res) {
-  // about to user-agent sniff
-  vary(res, 'User-Agent')
-
-  var ua = req.headers['user-agent'] || ''
-  var isMobile = /mobi|android|touch|mini/i.test(ua)
-
-  // serve site, depending on isMobile
-  res.setHeader('Content-Type', 'text/html')
-  res.end('You are (probably) ' + (isMobile ? '' : 'not ') + 'a mobile user')
-})
-```
-
-## Testing
-
-```sh
-$ npm test
-```
+Unpipes all destinations from a given stream. With stream 2+, this is
+equivalent to `stream.unpipe()`. When used with streams 1 style streams
+(typically Node.js 0.8 and below), this module attempts to undo the
+actions done in `stream.pipe(dest)`.
 
 ## License
 
 [MIT](LICENSE)
 
-[npm-image]: https://img.shields.io/npm/v/vary.svg
-[npm-url]: https://npmjs.org/package/vary
-[node-version-image]: https://img.shields.io/node/v/vary.svg
-[node-version-url]: https://nodejs.org/en/download
-[travis-image]: https://img.shields.io/travis/jshttp/vary/master.svg
-[travis-url]: https://travis-ci.org/jshttp/vary
-[coveralls-image]: https://img.shields.io/coveralls/jshttp/vary/master.svg
-[coveralls-url]: https://coveralls.io/r/jshttp/vary
-[downloads-image]: https://img.shields.io/npm/dm/vary.svg
-[downloads-url]: https://npmjs.org/package/vary
+[npm-image]: https://img.shields.io/npm/v/unpipe.svg
+[npm-url]: https://npmjs.org/package/unpipe
+[node-image]: https://img.shields.io/node/v/unpipe.svg
+[node-url]: http://nodejs.org/download/
+[travis-image]: https://img.shields.io/travis/stream-utils/unpipe.svg
+[travis-url]: https://travis-ci.org/stream-utils/unpipe
+[coveralls-image]: https://img.shields.io/coveralls/stream-utils/unpipe.svg
+[coveralls-url]: https://coveralls.io/r/stream-utils/unpipe?branch=master
+[downloads-image]: https://img.shields.io/npm/dm/unpipe.svg
+[downloads-url]: https://npmjs.org/package/unpipe
