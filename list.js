@@ -1,8 +1,11 @@
 'use strict'
 
-// tar -x
+// XXX: This shares a lot in common with extract.js
+// maybe some DRY opportunity here?
+
+// tar -t
 const hlo = require('./high-level-opt.js')
-const Unpack = require('./unpack.js')
+const Parser = require('./parse.js')
 const fs = require('fs')
 const fsm = require('fs-minipass')
 const path = require('path')
@@ -39,10 +42,21 @@ module.exports = (opt_, files, cb) => {
     filesFilter(opt, files)
   }
 
-  return opt.file && opt.sync ? extractFileSync(opt)
-    : opt.file ? extractFile(opt, cb)
-    : opt.sync ? extractSync(opt)
-    : extract(opt)
+  if (!opt.noResume) {
+    onentryFunction(opt)
+  }
+
+  return opt.file && opt.sync ? listFileSync(opt)
+    : opt.file ? listFile(opt, cb)
+    : list(opt)
+}
+
+const onentryFunction = opt => {
+  const onentry = opt.onentry
+  opt.onentry = onentry ? e => {
+    onentry(e)
+    e.resume()
+  } : e => e.resume()
 }
 
 // construct a filter that limits the file entries listed
@@ -66,32 +80,46 @@ const filesFilter = (opt, files) => {
     : file => mapHas(stripSlash(file))
 }
 
-const extractFileSync = opt => {
-  const u = new Unpack.Sync(opt)
-
+const listFileSync = opt => {
+  const p = list(opt)
   const file = opt.file
-  const stat = fs.statSync(file)
-  // This trades a zero-byte read() syscall for a stat
-  // However, it will usually result in less memory allocation
-  const readSize = opt.maxReadSize || 16 * 1024 * 1024
-  const stream = new fsm.ReadStreamSync(file, {
-    readSize: readSize,
-    size: stat.size,
-  })
-  stream.pipe(u)
+  let threw = true
+  let fd
+  try {
+    const stat = fs.statSync(file)
+    const readSize = opt.maxReadSize || 16 * 1024 * 1024
+    if (stat.size < readSize) {
+      p.end(fs.readFileSync(file))
+    } else {
+      let pos = 0
+      const buf = Buffer.allocUnsafe(readSize)
+      fd = fs.openSync(file, 'r')
+      while (pos < stat.size) {
+        const bytesRead = fs.readSync(fd, buf, 0, readSize, pos)
+        pos += bytesRead
+        p.write(buf.slice(0, bytesRead))
+      }
+      p.end()
+    }
+    threw = false
+  } finally {
+    if (threw && fd) {
+      try {
+        fs.closeSync(fd)
+      } catch (er) {}
+    }
+  }
 }
 
-const extractFile = (opt, cb) => {
-  const u = new Unpack(opt)
+const listFile = (opt, cb) => {
+  const parse = new Parser(opt)
   const readSize = opt.maxReadSize || 16 * 1024 * 1024
 
   const file = opt.file
   const p = new Promise((resolve, reject) => {
-    u.on('error', reject)
-    u.on('close', resolve)
+    parse.on('error', reject)
+    parse.on('end', resolve)
 
-    // This trades a zero-byte read() syscall for a stat
-    // However, it will usually result in less memory allocation
     fs.stat(file, (er, stat) => {
       if (er) {
         reject(er)
@@ -101,13 +129,11 @@ const extractFile = (opt, cb) => {
           size: stat.size,
         })
         stream.on('error', reject)
-        stream.pipe(u)
+        stream.pipe(parse)
       }
     })
   })
   return cb ? p.then(cb, cb) : p
 }
 
-const extractSync = opt => new Unpack.Sync(opt)
-
-const extract = opt => new Unpack(opt)
+const list = opt => new Parser(opt)

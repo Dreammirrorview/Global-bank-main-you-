@@ -1,255 +1,432 @@
-var constants = require('fs-constants')
-var eos = require('end-of-stream')
-var inherits = require('inherits')
-var alloc = Buffer.alloc
+'use strict'
 
-var Readable = require('readable-stream').Readable
-var Writable = require('readable-stream').Writable
-var StringDecoder = require('string_decoder').StringDecoder
+// A readable tar stream creator
+// Technically, this is a transform stream that you write paths into,
+// and tar format comes out of.
+// The `add()` method is like `write()` but returns this,
+// and end() return `this` as well, so you can
+// do `new Pack(opt).add('files').add('dir').end().pipe(output)
+// You could also do something like:
+// streamOfPaths().pipe(new Pack()).pipe(new fs.WriteStream('out.tar'))
 
-var headers = require('./headers')
-
-var DMODE = parseInt('755', 8)
-var FMODE = parseInt('644', 8)
-
-var END_OF_TAR = alloc(1024)
-
-var noop = function () {}
-
-var overflow = function (self, size) {
-  size &= 511
-  if (size) self.push(END_OF_TAR.slice(0, 512 - size))
-}
-
-function modeToType (mode) {
-  switch (mode & constants.S_IFMT) {
-    case constants.S_IFBLK: return 'block-device'
-    case constants.S_IFCHR: return 'character-device'
-    case constants.S_IFDIR: return 'directory'
-    case constants.S_IFIFO: return 'fifo'
-    case constants.S_IFLNK: return 'symlink'
+class PackJob {
+  constructor (path, absolute) {
+    this.path = path || './'
+    this.absolute = absolute
+    this.entry = null
+    this.stat = null
+    this.readdir = null
+    this.pending = false
+    this.ignore = false
+    this.piped = false
   }
-
-  return 'file'
 }
 
-var Sink = function (to) {
-  Writable.call(this)
-  this.written = 0
-  this._to = to
-  this._destroyed = false
-}
+const { Minipass } = require('minipass')
+const zlib = require('minizlib')
+const ReadEntry = require('./read-entry.js')
+const WriteEntry = require('./write-entry.js')
+const WriteEntrySync = WriteEntry.Sync
+const WriteEntryTar = WriteEntry.Tar
+const Yallist = require('yallist')
+const EOF = Buffer.alloc(1024)
+const ONSTAT = Symbol('onStat')
+const ENDED = Symbol('ended')
+const QUEUE = Symbol('queue')
+const CURRENT = Symbol('current')
+const PROCESS = Symbol('process')
+const PROCESSING = Symbol('processing')
+const PROCESSJOB = Symbol('processJob')
+const JOBS = Symbol('jobs')
+const JOBDONE = Symbol('jobDone')
+const ADDFSENTRY = Symbol('addFSEntry')
+const ADDTARENTRY = Symbol('addTarEntry')
+const STAT = Symbol('stat')
+const READDIR = Symbol('readdir')
+const ONREADDIR = Symbol('onreaddir')
+const PIPE = Symbol('pipe')
+const ENTRY = Symbol('entry')
+const ENTRYOPT = Symbol('entryOpt')
+const WRITEENTRYCLASS = Symbol('writeEntryClass')
+const WRITE = Symbol('write')
+const ONDRAIN = Symbol('ondrain')
 
-inherits(Sink, Writable)
+const fs = require('fs')
+const path = require('path')
+const warner = require('./warn-mixin.js')
+const normPath = require('./normalize-windows-path.js')
 
-Sink.prototype._write = function (data, enc, cb) {
-  this.written += data.length
-  if (this._to.push(data)) return cb()
-  this._to._drain = cb
-}
+const Pack = warner(class Pack extends Minipass {
+  constructor (opt) {
+    super(opt)
+    opt = opt || Object.create(null)
+    this.opt = opt
+    this.file = opt.file || ''
+    this.cwd = opt.cwd || process.cwd()
+    this.maxReadSize = opt.maxReadSize
+    this.preservePaths = !!opt.preservePaths
+    this.strict = !!opt.strict
+    this.noPax = !!opt.noPax
+    this.prefix = normPath(opt.prefix || '')
+    this.linkCache = opt.linkCache || new Map()
+    this.statCache = opt.statCache || new Map()
+    this.readdirCache = opt.readdirCache || new Map()
 
-Sink.prototype.destroy = function () {
-  if (this._destroyed) return
-  this._destroyed = true
-  this.emit('close')
-}
+    this[WRITEENTRYCLASS] = WriteEntry
+    if (typeof opt.onwarn === 'function') {
+      this.on('warn', opt.onwarn)
+    }
 
-var LinkSink = function () {
-  Writable.call(this)
-  this.linkname = ''
-  this._decoder = new StringDecoder('utf-8')
-  this._destroyed = false
-}
+    this.portable = !!opt.portable
+    this.zip = null
 
-inherits(LinkSink, Writable)
-
-LinkSink.prototype._write = function (data, enc, cb) {
-  this.linkname += this._decoder.write(data)
-  cb()
-}
-
-LinkSink.prototype.destroy = function () {
-  if (this._destroyed) return
-  this._destroyed = true
-  this.emit('close')
-}
-
-var Void = function () {
-  Writable.call(this)
-  this._destroyed = false
-}
-
-inherits(Void, Writable)
-
-Void.prototype._write = function (data, enc, cb) {
-  cb(new Error('No body allowed for this entry'))
-}
-
-Void.prototype.destroy = function () {
-  if (this._destroyed) return
-  this._destroyed = true
-  this.emit('close')
-}
-
-var Pack = function (opts) {
-  if (!(this instanceof Pack)) return new Pack(opts)
-  Readable.call(this, opts)
-
-  this._drain = noop
-  this._finalized = false
-  this._finalizing = false
-  this._destroyed = false
-  this._stream = null
-}
-
-inherits(Pack, Readable)
-
-Pack.prototype.entry = function (header, buffer, callback) {
-  if (this._stream) throw new Error('already piping an entry')
-  if (this._finalized || this._destroyed) return
-
-  if (typeof buffer === 'function') {
-    callback = buffer
-    buffer = null
-  }
-
-  if (!callback) callback = noop
-
-  var self = this
-
-  if (!header.size || header.type === 'symlink') header.size = 0
-  if (!header.type) header.type = modeToType(header.mode)
-  if (!header.mode) header.mode = header.type === 'directory' ? DMODE : FMODE
-  if (!header.uid) header.uid = 0
-  if (!header.gid) header.gid = 0
-  if (!header.mtime) header.mtime = new Date()
-
-  if (typeof buffer === 'string') buffer = Buffer.from(buffer)
-  if (Buffer.isBuffer(buffer)) {
-    header.size = buffer.length
-    this._encode(header)
-    var ok = this.push(buffer)
-    overflow(self, header.size)
-    if (ok) process.nextTick(callback)
-    else this._drain = callback
-    return new Void()
-  }
-
-  if (header.type === 'symlink' && !header.linkname) {
-    var linkSink = new LinkSink()
-    eos(linkSink, function (err) {
-      if (err) { // stream was closed
-        self.destroy()
-        return callback(err)
+    if (opt.gzip || opt.brotli) {
+      if (opt.gzip && opt.brotli) {
+        throw new TypeError('gzip and brotli are mutually exclusive')
       }
+      if (opt.gzip) {
+        if (typeof opt.gzip !== 'object') {
+          opt.gzip = {}
+        }
+        if (this.portable) {
+          opt.gzip.portable = true
+        }
+        this.zip = new zlib.Gzip(opt.gzip)
+      }
+      if (opt.brotli) {
+        if (typeof opt.brotli !== 'object') {
+          opt.brotli = {}
+        }
+        this.zip = new zlib.BrotliCompress(opt.brotli)
+      }
+      this.zip.on('data', chunk => super.write(chunk))
+      this.zip.on('end', _ => super.end())
+      this.zip.on('drain', _ => this[ONDRAIN]())
+      this.on('resume', _ => this.zip.resume())
+    } else {
+      this.on('drain', this[ONDRAIN])
+    }
 
-      header.linkname = linkSink.linkname
-      self._encode(header)
-      callback()
+    this.noDirRecurse = !!opt.noDirRecurse
+    this.follow = !!opt.follow
+    this.noMtime = !!opt.noMtime
+    this.mtime = opt.mtime || null
+
+    this.filter = typeof opt.filter === 'function' ? opt.filter : _ => true
+
+    this[QUEUE] = new Yallist()
+    this[JOBS] = 0
+    this.jobs = +opt.jobs || 4
+    this[PROCESSING] = false
+    this[ENDED] = false
+  }
+
+  [WRITE] (chunk) {
+    return super.write(chunk)
+  }
+
+  add (path) {
+    this.write(path)
+    return this
+  }
+
+  end (path) {
+    if (path) {
+      this.write(path)
+    }
+    this[ENDED] = true
+    this[PROCESS]()
+    return this
+  }
+
+  write (path) {
+    if (this[ENDED]) {
+      throw new Error('write after end')
+    }
+
+    if (path instanceof ReadEntry) {
+      this[ADDTARENTRY](path)
+    } else {
+      this[ADDFSENTRY](path)
+    }
+    return this.flowing
+  }
+
+  [ADDTARENTRY] (p) {
+    const absolute = normPath(path.resolve(this.cwd, p.path))
+    // in this case, we don't have to wait for the stat
+    if (!this.filter(p.path, p)) {
+      p.resume()
+    } else {
+      const job = new PackJob(p.path, absolute, false)
+      job.entry = new WriteEntryTar(p, this[ENTRYOPT](job))
+      job.entry.on('end', _ => this[JOBDONE](job))
+      this[JOBS] += 1
+      this[QUEUE].push(job)
+    }
+
+    this[PROCESS]()
+  }
+
+  [ADDFSENTRY] (p) {
+    const absolute = normPath(path.resolve(this.cwd, p))
+    this[QUEUE].push(new PackJob(p, absolute))
+    this[PROCESS]()
+  }
+
+  [STAT] (job) {
+    job.pending = true
+    this[JOBS] += 1
+    const stat = this.follow ? 'stat' : 'lstat'
+    fs[stat](job.absolute, (er, stat) => {
+      job.pending = false
+      this[JOBS] -= 1
+      if (er) {
+        this.emit('error', er)
+      } else {
+        this[ONSTAT](job, stat)
+      }
     })
-
-    return linkSink
   }
 
-  this._encode(header)
+  [ONSTAT] (job, stat) {
+    this.statCache.set(job.absolute, stat)
+    job.stat = stat
 
-  if (header.type !== 'file' && header.type !== 'contiguous-file') {
-    process.nextTick(callback)
-    return new Void()
-  }
-
-  var sink = new Sink(this)
-
-  this._stream = sink
-
-  eos(sink, function (err) {
-    self._stream = null
-
-    if (err) { // stream was closed
-      self.destroy()
-      return callback(err)
+    // now we have the stat, we can filter it.
+    if (!this.filter(job.path, stat)) {
+      job.ignore = true
     }
 
-    if (sink.written !== header.size) { // corrupting tar
-      self.destroy()
-      return callback(new Error('size mismatch'))
-    }
-
-    overflow(self, header.size)
-    if (self._finalizing) self.finalize()
-    callback()
-  })
-
-  return sink
-}
-
-Pack.prototype.finalize = function () {
-  if (this._stream) {
-    this._finalizing = true
-    return
+    this[PROCESS]()
   }
 
-  if (this._finalized) return
-  this._finalized = true
-  this.push(END_OF_TAR)
-  this.push(null)
-}
+  [READDIR] (job) {
+    job.pending = true
+    this[JOBS] += 1
+    fs.readdir(job.absolute, (er, entries) => {
+      job.pending = false
+      this[JOBS] -= 1
+      if (er) {
+        return this.emit('error', er)
+      }
+      this[ONREADDIR](job, entries)
+    })
+  }
 
-Pack.prototype.destroy = function (err) {
-  if (this._destroyed) return
-  this._destroyed = true
+  [ONREADDIR] (job, entries) {
+    this.readdirCache.set(job.absolute, entries)
+    job.readdir = entries
+    this[PROCESS]()
+  }
 
-  if (err) this.emit('error', err)
-  this.emit('close')
-  if (this._stream && this._stream.destroy) this._stream.destroy()
-}
-
-Pack.prototype._encode = function (header) {
-  if (!header.pax) {
-    var buf = headers.encode(header)
-    if (buf) {
-      this.push(buf)
+  [PROCESS] () {
+    if (this[PROCESSING]) {
       return
     }
+
+    this[PROCESSING] = true
+    for (let w = this[QUEUE].head;
+      w !== null && this[JOBS] < this.jobs;
+      w = w.next) {
+      this[PROCESSJOB](w.value)
+      if (w.value.ignore) {
+        const p = w.next
+        this[QUEUE].removeNode(w)
+        w.next = p
+      }
+    }
+
+    this[PROCESSING] = false
+
+    if (this[ENDED] && !this[QUEUE].length && this[JOBS] === 0) {
+      if (this.zip) {
+        this.zip.end(EOF)
+      } else {
+        super.write(EOF)
+        super.end()
+      }
+    }
   }
-  this._encodePax(header)
-}
 
-Pack.prototype._encodePax = function (header) {
-  var paxHeader = headers.encodePax({
-    name: header.name,
-    linkname: header.linkname,
-    pax: header.pax
-  })
-
-  var newHeader = {
-    name: 'PaxHeader',
-    mode: header.mode,
-    uid: header.uid,
-    gid: header.gid,
-    size: paxHeader.length,
-    mtime: header.mtime,
-    type: 'pax-header',
-    linkname: header.linkname && 'PaxHeader',
-    uname: header.uname,
-    gname: header.gname,
-    devmajor: header.devmajor,
-    devminor: header.devminor
+  get [CURRENT] () {
+    return this[QUEUE] && this[QUEUE].head && this[QUEUE].head.value
   }
 
-  this.push(headers.encode(newHeader))
-  this.push(paxHeader)
-  overflow(this, paxHeader.length)
+  [JOBDONE] (job) {
+    this[QUEUE].shift()
+    this[JOBS] -= 1
+    this[PROCESS]()
+  }
 
-  newHeader.size = header.size
-  newHeader.type = header.type
-  this.push(headers.encode(newHeader))
+  [PROCESSJOB] (job) {
+    if (job.pending) {
+      return
+    }
+
+    if (job.entry) {
+      if (job === this[CURRENT] && !job.piped) {
+        this[PIPE](job)
+      }
+      return
+    }
+
+    if (!job.stat) {
+      if (this.statCache.has(job.absolute)) {
+        this[ONSTAT](job, this.statCache.get(job.absolute))
+      } else {
+        this[STAT](job)
+      }
+    }
+    if (!job.stat) {
+      return
+    }
+
+    // filtered out!
+    if (job.ignore) {
+      return
+    }
+
+    if (!this.noDirRecurse && job.stat.isDirectory() && !job.readdir) {
+      if (this.readdirCache.has(job.absolute)) {
+        this[ONREADDIR](job, this.readdirCache.get(job.absolute))
+      } else {
+        this[READDIR](job)
+      }
+      if (!job.readdir) {
+        return
+      }
+    }
+
+    // we know it doesn't have an entry, because that got checked above
+    job.entry = this[ENTRY](job)
+    if (!job.entry) {
+      job.ignore = true
+      return
+    }
+
+    if (job === this[CURRENT] && !job.piped) {
+      this[PIPE](job)
+    }
+  }
+
+  [ENTRYOPT] (job) {
+    return {
+      onwarn: (code, msg, data) => this.warn(code, msg, data),
+      noPax: this.noPax,
+      cwd: this.cwd,
+      absolute: job.absolute,
+      preservePaths: this.preservePaths,
+      maxReadSize: this.maxReadSize,
+      strict: this.strict,
+      portable: this.portable,
+      linkCache: this.linkCache,
+      statCache: this.statCache,
+      noMtime: this.noMtime,
+      mtime: this.mtime,
+      prefix: this.prefix,
+    }
+  }
+
+  [ENTRY] (job) {
+    this[JOBS] += 1
+    try {
+      return new this[WRITEENTRYCLASS](job.path, this[ENTRYOPT](job))
+        .on('end', () => this[JOBDONE](job))
+        .on('error', er => this.emit('error', er))
+    } catch (er) {
+      this.emit('error', er)
+    }
+  }
+
+  [ONDRAIN] () {
+    if (this[CURRENT] && this[CURRENT].entry) {
+      this[CURRENT].entry.resume()
+    }
+  }
+
+  // like .pipe() but using super, because our write() is special
+  [PIPE] (job) {
+    job.piped = true
+
+    if (job.readdir) {
+      job.readdir.forEach(entry => {
+        const p = job.path
+        const base = p === './' ? '' : p.replace(/\/*$/, '/')
+        this[ADDFSENTRY](base + entry)
+      })
+    }
+
+    const source = job.entry
+    const zip = this.zip
+
+    if (zip) {
+      source.on('data', chunk => {
+        if (!zip.write(chunk)) {
+          source.pause()
+        }
+      })
+    } else {
+      source.on('data', chunk => {
+        if (!super.write(chunk)) {
+          source.pause()
+        }
+      })
+    }
+  }
+
+  pause () {
+    if (this.zip) {
+      this.zip.pause()
+    }
+    return super.pause()
+  }
+})
+
+class PackSync extends Pack {
+  constructor (opt) {
+    super(opt)
+    this[WRITEENTRYCLASS] = WriteEntrySync
+  }
+
+  // pause/resume are no-ops in sync streams.
+  pause () {}
+  resume () {}
+
+  [STAT] (job) {
+    const stat = this.follow ? 'statSync' : 'lstatSync'
+    this[ONSTAT](job, fs[stat](job.absolute))
+  }
+
+  [READDIR] (job, stat) {
+    this[ONREADDIR](job, fs.readdirSync(job.absolute))
+  }
+
+  // gotta get it all in this tick
+  [PIPE] (job) {
+    const source = job.entry
+    const zip = this.zip
+
+    if (job.readdir) {
+      job.readdir.forEach(entry => {
+        const p = job.path
+        const base = p === './' ? '' : p.replace(/\/*$/, '/')
+        this[ADDFSENTRY](base + entry)
+      })
+    }
+
+    if (zip) {
+      source.on('data', chunk => {
+        zip.write(chunk)
+      })
+    } else {
+      source.on('data', chunk => {
+        super[WRITE](chunk)
+      })
+    }
+  }
 }
 
-Pack.prototype._read = function (n) {
-  var drain = this._drain
-  this._drain = noop
-  drain()
-}
+Pack.Sync = PackSync
 
 module.exports = Pack
