@@ -1,244 +1,346 @@
-'use strict'
+var test = require('tape')
+var rimraf = require('rimraf')
+var tar = require('../index')
+var tarStream = require('tar-stream')
+var path = require('path')
+var fs = require('fs')
+var os = require('os')
 
-var net = require('net')
-  , tls = require('tls')
-  , http = require('http')
-  , https = require('https')
-  , events = require('events')
-  , assert = require('assert')
-  , util = require('util')
-  , Buffer = require('safe-buffer').Buffer
-  ;
+var win32 = os.platform() === 'win32'
 
-exports.httpOverHttp = httpOverHttp
-exports.httpsOverHttp = httpsOverHttp
-exports.httpOverHttps = httpOverHttps
-exports.httpsOverHttps = httpsOverHttps
-
-
-function httpOverHttp(options) {
-  var agent = new TunnelingAgent(options)
-  agent.request = http.request
-  return agent
+var mtime = function (st) {
+  return Math.floor(st.mtime.getTime() / 1000)
 }
 
-function httpsOverHttp(options) {
-  var agent = new TunnelingAgent(options)
-  agent.request = http.request
-  agent.createSocket = createSecureSocket
-  agent.defaultPort = 443
-  return agent
-}
+test('copy a -> copy/a', function (t) {
+  t.plan(5)
 
-function httpOverHttps(options) {
-  var agent = new TunnelingAgent(options)
-  agent.request = https.request
-  return agent
-}
+  var a = path.join(__dirname, 'fixtures', 'a')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'a')
 
-function httpsOverHttps(options) {
-  var agent = new TunnelingAgent(options)
-  agent.request = https.request
-  agent.createSocket = createSecureSocket
-  agent.defaultPort = 443
-  return agent
-}
+  rimraf.sync(b)
+  tar.pack(a)
+    .pipe(tar.extract(b))
+    .on('finish', function () {
+      var files = fs.readdirSync(b)
+      t.same(files.length, 1)
+      t.same(files[0], 'hello.txt')
+      var fileB = path.join(b, files[0])
+      var fileA = path.join(a, files[0])
+      t.same(fs.readFileSync(fileB, 'utf-8'), fs.readFileSync(fileA, 'utf-8'))
+      t.same(fs.statSync(fileB).mode, fs.statSync(fileA).mode)
+      t.same(mtime(fs.statSync(fileB)), mtime(fs.statSync(fileA)))
+    })
+})
 
+test('copy b -> copy/b', function (t) {
+  t.plan(8)
 
-function TunnelingAgent(options) {
-  var self = this
-  self.options = options || {}
-  self.proxyOptions = self.options.proxy || {}
-  self.maxSockets = self.options.maxSockets || http.Agent.defaultMaxSockets
-  self.requests = []
-  self.sockets = []
+  var a = path.join(__dirname, 'fixtures', 'b')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'b')
 
-  self.on('free', function onFree(socket, host, port) {
-    for (var i = 0, len = self.requests.length; i < len; ++i) {
-      var pending = self.requests[i]
-      if (pending.host === host && pending.port === port) {
-        // Detect the request to connect same origin server,
-        // reuse the connection.
-        self.requests.splice(i, 1)
-        pending.request.onSocket(socket)
-        return
-      }
-    }
-    socket.destroy()
-    self.removeSocket(socket)
-  })
-}
-util.inherits(TunnelingAgent, events.EventEmitter)
+  rimraf.sync(b)
+  tar.pack(a)
+    .pipe(tar.extract(b))
+    .on('finish', function () {
+      var files = fs.readdirSync(b)
+      t.same(files.length, 1)
+      t.same(files[0], 'a')
+      var dirB = path.join(b, files[0])
+      var dirA = path.join(a, files[0])
+      t.same(fs.statSync(dirB).mode, fs.statSync(dirA).mode)
+      t.same(mtime(fs.statSync(dirB)), mtime(fs.statSync(dirA)))
+      t.ok(fs.statSync(dirB).isDirectory())
+      var fileB = path.join(dirB, 'test.txt')
+      var fileA = path.join(dirA, 'test.txt')
+      t.same(fs.readFileSync(fileB, 'utf-8'), fs.readFileSync(fileA, 'utf-8'))
+      t.same(fs.statSync(fileB).mode, fs.statSync(fileA).mode)
+      t.same(mtime(fs.statSync(fileB)), mtime(fs.statSync(fileA)))
+    })
+})
 
-TunnelingAgent.prototype.addRequest = function addRequest(req, options) {
-  var self = this
-
-   // Legacy API: addRequest(req, host, port, path)
-  if (typeof options === 'string') {
-    options = {
-      host: options,
-      port: arguments[2],
-      path: arguments[3]
-    };
-  }
-
-  if (self.sockets.length >= this.maxSockets) {
-    // We are over limit so we'll add it to the queue.
-    self.requests.push({host: options.host, port: options.port, request: req})
+test('symlink', function (t) {
+  if (win32) { // no symlink support on win32 currently. TODO: test if this can be enabled somehow
+    t.plan(1)
+    t.ok(true)
     return
   }
 
-  // If we are under maxSockets create a new one.
-  self.createConnection({host: options.host, port: options.port, request: req})
-}
+  t.plan(5)
 
-TunnelingAgent.prototype.createConnection = function createConnection(pending) {
-  var self = this
+  var a = path.join(__dirname, 'fixtures', 'c')
 
-  self.createSocket(pending, function(socket) {
-    socket.on('free', onFree)
-    socket.on('close', onCloseOrRemove)
-    socket.on('agentRemove', onCloseOrRemove)
-    pending.request.onSocket(socket)
+  rimraf.sync(path.join(a, 'link'))
+  fs.symlinkSync('.gitignore', path.join(a, 'link'))
 
-    function onFree() {
-      self.emit('free', socket, pending.host, pending.port)
-    }
+  var b = path.join(__dirname, 'fixtures', 'copy', 'c')
 
-    function onCloseOrRemove(err) {
-      self.removeSocket(socket)
-      socket.removeListener('free', onFree)
-      socket.removeListener('close', onCloseOrRemove)
-      socket.removeListener('agentRemove', onCloseOrRemove)
-    }
-  })
-}
+  rimraf.sync(b)
+  tar.pack(a)
+    .pipe(tar.extract(b))
+    .on('finish', function () {
+      var files = fs.readdirSync(b).sort()
+      t.same(files.length, 2)
+      t.same(files[0], '.gitignore')
+      t.same(files[1], 'link')
 
-TunnelingAgent.prototype.createSocket = function createSocket(options, cb) {
-  var self = this
-  var placeholder = {}
-  self.sockets.push(placeholder)
+      var linkA = path.join(a, 'link')
+      var linkB = path.join(b, 'link')
 
-  var connectOptions = mergeOptions({}, self.proxyOptions,
-    { method: 'CONNECT'
-    , path: options.host + ':' + options.port
-    , agent: false
-    }
-  )
-  if (connectOptions.proxyAuth) {
-    connectOptions.headers = connectOptions.headers || {}
-    connectOptions.headers['Proxy-Authorization'] = 'Basic ' +
-        Buffer.from(connectOptions.proxyAuth).toString('base64')
-  }
-
-  debug('making CONNECT request')
-  var connectReq = self.request(connectOptions)
-  connectReq.useChunkedEncodingByDefault = false // for v0.6
-  connectReq.once('response', onResponse) // for v0.6
-  connectReq.once('upgrade', onUpgrade)   // for v0.6
-  connectReq.once('connect', onConnect)   // for v0.7 or later
-  connectReq.once('error', onError)
-  connectReq.end()
-
-  function onResponse(res) {
-    // Very hacky. This is necessary to avoid http-parser leaks.
-    res.upgrade = true
-  }
-
-  function onUpgrade(res, socket, head) {
-    // Hacky.
-    process.nextTick(function() {
-      onConnect(res, socket, head)
+      t.same(mtime(fs.lstatSync(linkB)), mtime(fs.lstatSync(linkA)))
+      t.same(fs.readlinkSync(linkB), fs.readlinkSync(linkA))
     })
+})
+
+test('follow symlinks', function (t) {
+  if (win32) { // no symlink support on win32 currently. TODO: test if this can be enabled somehow
+    t.plan(1)
+    t.ok(true)
+    return
   }
 
-  function onConnect(res, socket, head) {
-    connectReq.removeAllListeners()
-    socket.removeAllListeners()
+  t.plan(5)
 
-    if (res.statusCode === 200) {
-      assert.equal(head.length, 0)
-      debug('tunneling connection has established')
-      self.sockets[self.sockets.indexOf(placeholder)] = socket
-      cb(socket)
-    } else {
-      debug('tunneling socket could not be established, statusCode=%d', res.statusCode)
-      var error = new Error('tunneling socket could not be established, ' + 'statusCode=' + res.statusCode)
-      error.code = 'ECONNRESET'
-      options.request.emit('error', error)
-      self.removeSocket(placeholder)
+  var a = path.join(__dirname, 'fixtures', 'c')
+
+  rimraf.sync(path.join(a, 'link'))
+  fs.symlinkSync('.gitignore', path.join(a, 'link'))
+
+  var b = path.join(__dirname, 'fixtures', 'copy', 'c-dereference')
+
+  rimraf.sync(b)
+  tar.pack(a, { dereference: true })
+    .pipe(tar.extract(b))
+    .on('finish', function () {
+      var files = fs.readdirSync(b).sort()
+      t.same(files.length, 2)
+      t.same(files[0], '.gitignore')
+      t.same(files[1], 'link')
+
+      var file1 = path.join(b, '.gitignore')
+      var file2 = path.join(b, 'link')
+
+      t.same(mtime(fs.lstatSync(file1)), mtime(fs.lstatSync(file2)))
+      t.same(fs.readFileSync(file1), fs.readFileSync(file2))
+    })
+})
+
+test('strip', function (t) {
+  t.plan(2)
+
+  var a = path.join(__dirname, 'fixtures', 'b')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'b-strip')
+
+  rimraf.sync(b)
+
+  tar.pack(a)
+    .pipe(tar.extract(b, { strip: 1 }))
+    .on('finish', function () {
+      var files = fs.readdirSync(b).sort()
+      t.same(files.length, 1)
+      t.same(files[0], 'test.txt')
+    })
+})
+
+test('strip + map', function (t) {
+  t.plan(2)
+
+  var a = path.join(__dirname, 'fixtures', 'b')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'b-strip')
+
+  rimraf.sync(b)
+
+  var uppercase = function (header) {
+    header.name = header.name.toUpperCase()
+    return header
+  }
+
+  tar.pack(a)
+    .pipe(tar.extract(b, { strip: 1, map: uppercase }))
+    .on('finish', function () {
+      var files = fs.readdirSync(b).sort()
+      t.same(files.length, 1)
+      t.same(files[0], 'TEST.TXT')
+    })
+})
+
+test('map + dir + permissions', function (t) {
+  t.plan(win32 ? 1 : 2) // skip chmod test, it's not working like unix
+
+  var a = path.join(__dirname, 'fixtures', 'b')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'a-perms')
+
+  rimraf.sync(b)
+
+  var aWithMode = function (header) {
+    if (header.name === 'a') {
+      header.mode = parseInt(700, 8)
+    }
+    return header
+  }
+
+  tar.pack(a)
+    .pipe(tar.extract(b, { map: aWithMode }))
+    .on('finish', function () {
+      var files = fs.readdirSync(b).sort()
+      var stat = fs.statSync(path.join(b, 'a'))
+      t.same(files.length, 1)
+      if (!win32) {
+        t.same(stat.mode & parseInt(777, 8), parseInt(700, 8))
+      }
+    })
+})
+
+test('specific entries', function (t) {
+  t.plan(6)
+
+  var a = path.join(__dirname, 'fixtures', 'd')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'd-entries')
+
+  var entries = ['file1', 'sub-files/file3', 'sub-dir']
+
+  rimraf.sync(b)
+  tar.pack(a, { entries: entries })
+    .pipe(tar.extract(b))
+    .on('finish', function () {
+      var files = fs.readdirSync(b)
+      t.same(files.length, 3)
+      t.notSame(files.indexOf('file1'), -1)
+      t.notSame(files.indexOf('sub-files'), -1)
+      t.notSame(files.indexOf('sub-dir'), -1)
+      var subFiles = fs.readdirSync(path.join(b, 'sub-files'))
+      t.same(subFiles, ['file3'])
+      var subDir = fs.readdirSync(path.join(b, 'sub-dir'))
+      t.same(subDir, ['file5'])
+    })
+})
+
+test('check type while mapping header on packing', function (t) {
+  t.plan(3)
+
+  var e = path.join(__dirname, 'fixtures', 'e')
+
+  var checkHeaderType = function (header) {
+    if (header.name.indexOf('.') === -1) t.same(header.type, header.name)
+  }
+
+  tar.pack(e, { map: checkHeaderType })
+})
+
+test('finish callbacks', function (t) {
+  t.plan(3)
+
+  var a = path.join(__dirname, 'fixtures', 'a')
+  var b = path.join(__dirname, 'fixtures', 'copy', 'a')
+
+  rimraf.sync(b)
+
+  var packEntries = 0
+  var extractEntries = 0
+
+  var countPackEntry = function (header) { packEntries++ }
+  var countExtractEntry = function (header) { extractEntries++ }
+
+  var pack
+  var onPackFinish = function (passedPack) {
+    t.equal(packEntries, 2, 'All entries have been packed') // 2 entries - the file and base directory
+    t.equal(passedPack, pack, 'The finish hook passes the pack')
+  }
+
+  var onExtractFinish = function () { t.equal(extractEntries, 2) }
+
+  pack = tar.pack(a, { map: countPackEntry, finish: onPackFinish })
+
+  pack.pipe(tar.extract(b, { map: countExtractEntry, finish: onExtractFinish }))
+    .on('finish', function () {
+      t.end()
+    })
+})
+
+test('not finalizing the pack', function (t) {
+  t.plan(2)
+
+  var a = path.join(__dirname, 'fixtures', 'a')
+  var b = path.join(__dirname, 'fixtures', 'b')
+
+  var out = path.join(__dirname, 'fixtures', 'copy', 'merged-packs')
+
+  rimraf.sync(out)
+
+  var prefixer = function (prefix) {
+    return function (header) {
+      header.name = path.join(prefix, header.name)
+      return header
     }
   }
 
-  function onError(cause) {
-    connectReq.removeAllListeners()
-
-    debug('tunneling socket could not be established, cause=%s\n', cause.message, cause.stack)
-    var error = new Error('tunneling socket could not be established, ' + 'cause=' + cause.message)
-    error.code = 'ECONNRESET'
-    options.request.emit('error', error)
-    self.removeSocket(placeholder)
-  }
-}
-
-TunnelingAgent.prototype.removeSocket = function removeSocket(socket) {
-  var pos = this.sockets.indexOf(socket)
-  if (pos === -1) return
-
-  this.sockets.splice(pos, 1)
-
-  var pending = this.requests.shift()
-  if (pending) {
-    // If we have pending requests and a socket gets closed a new one
-    // needs to be created to take over in the pool for the one that closed.
-    this.createConnection(pending)
-  }
-}
-
-function createSecureSocket(options, cb) {
-  var self = this
-  TunnelingAgent.prototype.createSocket.call(self, options, function(socket) {
-    // 0 is dummy port for v0.6
-    var secureSocket = tls.connect(0, mergeOptions({}, self.options,
-      { servername: options.host
-      , socket: socket
-      }
-    ))
-    self.sockets[self.sockets.indexOf(socket)] = secureSocket
-    cb(secureSocket)
+  tar.pack(a, {
+    map: prefixer('a-files'),
+    finalize: false,
+    finish: packB
   })
-}
 
-
-function mergeOptions(target) {
-  for (var i = 1, len = arguments.length; i < len; ++i) {
-    var overrides = arguments[i]
-    if (typeof overrides === 'object') {
-      var keys = Object.keys(overrides)
-      for (var j = 0, keyLen = keys.length; j < keyLen; ++j) {
-        var k = keys[j]
-        if (overrides[k] !== undefined) {
-          target[k] = overrides[k]
-        }
-      }
-    }
+  function packB (pack) {
+    tar.pack(b, { pack: pack, map: prefixer('b-files') })
+      .pipe(tar.extract(out))
+      .on('finish', assertResults)
   }
-  return target
-}
 
-
-var debug
-if (process.env.NODE_DEBUG && /\btunnel\b/.test(process.env.NODE_DEBUG)) {
-  debug = function() {
-    var args = Array.prototype.slice.call(arguments)
-    if (typeof args[0] === 'string') {
-      args[0] = 'TUNNEL: ' + args[0]
-    } else {
-      args.unshift('TUNNEL:')
-    }
-    console.error.apply(console, args)
+  function assertResults () {
+    var containers = fs.readdirSync(out)
+    t.deepEqual(containers, ['a-files', 'b-files'])
+    var aFiles = fs.readdirSync(path.join(out, 'a-files'))
+    t.deepEqual(aFiles, ['hello.txt'])
   }
-} else {
-  debug = function() {}
-}
-exports.debug = debug // for test
+})
+
+test('do not extract invalid tar', function (t) {
+  var a = path.join(__dirname, 'fixtures', 'invalid.tar')
+
+  var out = path.join(__dirname, 'fixtures', 'invalid')
+
+  rimraf.sync(out)
+
+  fs.createReadStream(a)
+    .pipe(tar.extract(out))
+    .on('error', function (err) {
+      t.ok(/is not a valid symlink/i.test(err.message))
+      fs.stat(path.join(out, '../bar'), function (err) {
+        t.ok(err)
+        t.end()
+      })
+    })
+})
+
+test('no abs hardlink targets', function (t) {
+  var out = path.join(__dirname, 'fixtures', 'invalid')
+  var outside = path.join(__dirname, 'fixtures', 'outside')
+
+  rimraf.sync(out)
+
+  var s = tarStream.pack()
+
+  fs.writeFileSync(outside, 'something')
+
+  s.entry({
+    type: 'link',
+    name: 'link',
+    linkname: outside
+  })
+
+  s.entry({
+    name: 'link'
+  }, 'overwrite')
+
+  s.finalize()
+
+  s.pipe(tar.extract(out))
+    .on('error', function (err) {
+      t.ok(err, 'had error')
+      fs.readFile(outside, 'utf-8', function (err, str) {
+        t.error(err, 'no error')
+        t.same(str, 'something')
+        t.end()
+      })
+    })
+})

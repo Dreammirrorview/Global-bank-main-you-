@@ -1,4 +1,3 @@
-tunnel-agent
-============
+Like `chown -R`.
 
-HTTP proxy tunneling agent. Formerly part of mikeal/request, now a standalone module.
+Takes the same arguments as `fs.chown()`

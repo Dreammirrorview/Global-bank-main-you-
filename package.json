@@ -1,22 +1,29 @@
 {
-  "author": "Mikeal Rogers <mikeal.rogers@gmail.com> (http://www.futurealoof.com)",
-  "name": "tunnel-agent",
-  "license": "Apache-2.0",
-  "description": "HTTP proxy tunneling agent. Formerly part of mikeal/request, now a standalone module.",
-  "version": "0.6.0",
+  "author": "Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me/)",
+  "name": "chownr",
+  "description": "like `chown -R`",
+  "version": "1.1.4",
   "repository": {
-    "url": "https://github.com/mikeal/tunnel-agent"
+    "type": "git",
+    "url": "git://github.com/isaacs/chownr.git"
   },
-  "main": "index.js",
+  "main": "chownr.js",
   "files": [
-    "index.js"
+    "chownr.js"
   ],
-  "dependencies": {
-    "safe-buffer": "^5.0.1"
+  "devDependencies": {
+    "mkdirp": "0.3",
+    "rimraf": "^2.7.1",
+    "tap": "^14.10.6"
   },
-  "devDependencies": {},
-  "optionalDependencies": {},
-  "engines": {
-    "node": "*"
-  }
+  "tap": {
+    "check-coverage": true
+  },
+  "scripts": {
+    "test": "tap",
+    "preversion": "npm test",
+    "postversion": "npm publish",
+    "prepublishOnly": "git push origin --follow-tags"
+  },
+  "license": "ISC"
 }
